@@ -12,5 +12,5 @@ cp -a "$ROOT/src/Modules/flussonic_1f4a9" "$DIR/"
 cp "$ROOT/packaging/flussonic/install.sh" "$ROOT/packaging/flussonic/uninstall.sh" "$ROOT/packaging/flussonic/README.md" "$DIR/"
 mkdir -p "$OUT"
 (cd "$WORK" && zip -qr "$OUT/xcvm-flussonic-$VERSION.zip" "xcvm-flussonic-$VERSION")
-sha256sum "$OUT/xcvm-flussonic-$VERSION.zip" > "$OUT/xcvm-flussonic-$VERSION.zip.sha256"
+(cd "$OUT" && sha256sum "xcvm-flussonic-$VERSION.zip" > "xcvm-flussonic-$VERSION.zip.sha256")
 printf '%s\n' "$OUT/xcvm-flussonic-$VERSION.zip"
