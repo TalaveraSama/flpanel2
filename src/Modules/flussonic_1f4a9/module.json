@@ -1,0 +1,13 @@
+{
+  "name": "flussonic",
+  "hash_id": "1f4a96e8d32b4c7a9152f603eb78ad41",
+  "description": "Manage external M3U8 sources and Flussonic Media Server streams.",
+  "version": "0.1.0",
+  "requires_core": ">=2.3",
+  "environment": "main",
+  "priority": 0,
+  "dependencies": [],
+  "optional_dependencies": [],
+  "has_navbar": false,
+  "has_settings": true
+}
