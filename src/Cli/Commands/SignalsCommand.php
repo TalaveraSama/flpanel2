@@ -1,0 +1,226 @@
+<?php
+
+namespace XcVm\Cli\Commands;
+
+use XcVm\Cli\CommandInterface;
+use XcVm\Cli\DaemonTrait;
+use XcVm\Core\Cluster\NodeRole;
+use XcVm\Core\Config\SettingsManager;
+use XcVm\Domain\Cluster\ConnectionLimits;
+use XcVm\Domain\Cluster\LivenessService;
+use XcVm\Domain\Server\ServerRepository;
+use XcVm\Domain\Stream\StreamProcess;
+use XcVm\Infrastructure\Redis\RedisManager;
+use XcVm\Streaming\Fanout\FanoutClient;
+
+/**
+ * SignalsCommand — signals command
+ *
+ * @package XC_VM_CLI_Commands
+ * @author  Divarion_D <https://github.com/Divarion-D>
+ * @copyright 2025-2026 Vateron Media
+ * @link    https://github.com/Vateron-Media/XC_VM
+ * @license AGPL-3.0 https://www.gnu.org/licenses/agpl-3.0.html
+ */
+
+class SignalsCommand implements CommandInterface {
+	use DaemonTrait;
+
+	/** Seconds between syncs of supervised streams' rows from the fanout daemon. */
+	public const RECONCILE_INTERVAL = 5;
+
+	public function getName(): string {
+		return 'signals';
+	}
+
+	public function getDescription(): string {
+		return 'Daemon: process kill signals and cache signals from DB/Redis';
+	}
+
+	public function execute(array $rArgs): int {
+		if (!$this->assertRunAsXcVm()) {
+			return 1;
+		}
+		if (!$this->acquireDaemonLock('signals')) {
+			return 0;
+		}
+
+		global $db;
+
+		$this->setProcessTitle('XC_VM[Signals]');
+		$this->killStaleProcesses('console.php signals');
+		$this->killStaleProcesses('XC_VM\\[Signals\\]');
+		$this->initDaemonMD5();
+		$this->initRedisIfEnabled();
+
+		$rServers = ServerRepository::getAll();
+		$rLastReconcile = 0;
+		$rLastLiveness = 0;
+		$rIsMain = NodeRole::isMain();
+
+		while ($db && $db->ping()) {
+			if (!$this->refreshOrBreak()) {
+				break;
+			}
+			// Was every pass (four times a second): a `SELECT * FROM servers`
+			// against MAIN from every node, all day.
+			if ($this->serversRefreshDue()) {
+				$rServers = $this->refreshServers();
+			}
+
+			// Stop if Redis required but dead. checkRedisHealth() catches
+			// RedisException (NOAUTH/timeouts during a restart window) — a raw
+			// ping here used to kill the daemon with an uncaught exception.
+			if (!$this->checkRedisHealth()) {
+				break;
+			}
+
+			// Keep supervised streams' rows current: the fanout daemon runs their
+			// producers but cannot write the database, and the minute cron alone
+			// would leave a start showing "starting" (or a failure showing "up")
+			// for up to a minute. One control-socket call when nothing changed.
+			if (time() - $rLastReconcile >= self::RECONCILE_INTERVAL) {
+				$rLastReconcile = time();
+				StreamProcess::reconcileSupervised();
+			}
+
+			// MAIN's liveness loop for nodes whose agent reports telemetry:
+			// once a second, and each transition rewrites the servers cache.
+			if ($rIsMain && time() !== $rLastLiveness && SettingsManager::get('cluster_api_enabled')) {
+				$rLastLiveness = time();
+				try {
+					if (LivenessService::tick(max(10, min(300, intval(SettingsManager::get('cluster_offline_after_sec') ?: 30)))) !== []) {
+						$rServers = $this->refreshServers();
+					}
+				} catch (\Throwable $rE) {
+					echo 'Liveness: ' . $rE->getMessage() . "\n";
+				}
+				// max_connections for CONNECTIONS nodes' viewers, as they ask.
+				try {
+					ConnectionLimits::drain();
+				} catch (\Throwable $rE) {
+					echo 'Connection limits: ' . $rE->getMessage() . "\n";
+				}
+			}
+
+			// ── Kill-сигналы из БД ──────────────────────────────
+			if ($db->query('SELECT `signal_id`, `pid`, `rtmp` FROM `signals` WHERE `server_id` = ? AND `pid` IS NOT NULL ORDER BY `signal_id` ASC LIMIT 100', SERVER_ID)) {
+				if ($db->num_rows() > 0) {
+					$rIDs = [];
+					foreach ($db->get_rows() as $rRow) {
+						$rIDs[] = $rRow['signal_id'];
+						$rPID = $rRow['pid'];
+						if ($rRow['rtmp'] == 0) {
+							if (!empty($rPID) && file_exists('/proc/' . $rPID) && is_numeric($rPID) && 0 < $rPID) {
+								shell_exec('kill -9 ' . intval($rPID));
+							}
+						} else {
+							shell_exec('wget --timeout=2 -O /dev/null -o /dev/null "' . $rServers[SERVER_ID]['rtmp_mport_url'] . 'control/drop/client?clientid=' . intval($rPID) . '" >/dev/null 2>/dev/null &');
+						}
+					}
+					if (count($rIDs) > 0) {
+						$db->query('DELETE FROM `signals` WHERE `signal_id` IN (' . implode(',', $rIDs) . ')');
+					}
+				}
+
+				// ── Cache-сигналы из БД ─────────────────────────
+				if ($db->query('SELECT `signal_id`, `custom_data` FROM `signals` WHERE `server_id` = ? AND `cache` = 1 ORDER BY `signal_id` ASC LIMIT 1000;', SERVER_ID)) {
+					if ($db->num_rows() > 0) {
+						$rUpdatedStreams = $rUpdatedLines = $rIDs = [];
+						foreach ($db->get_rows() as $rRow) {
+							$rCustomData = json_decode($rRow['custom_data'], true);
+							$rIDs[] = $rRow['signal_id'];
+							switch ($rCustomData['type']) {
+								case 'update_stream':
+									if (!in_array($rCustomData['id'], $rUpdatedStreams)) {
+										$rUpdatedStreams[] = $rCustomData['id'];
+									}
+									break;
+								case 'update_line':
+									if (!in_array($rCustomData['id'], $rUpdatedLines)) {
+										$rUpdatedLines[] = $rCustomData['id'];
+									}
+									break;
+								case 'update_streams':
+									foreach ($rCustomData['id'] as $rID) {
+										if (!in_array($rID, $rUpdatedStreams)) {
+											$rUpdatedStreams[] = $rID;
+										}
+									}
+									break;
+								case 'update_lines':
+									foreach ($rCustomData['id'] as $rID) {
+										if (!in_array($rID, $rUpdatedLines)) {
+											$rUpdatedLines[] = $rID;
+										}
+									}
+									break;
+								case 'delete_con':
+									// The connection file may already be gone (the stream
+									// closed between the signal being queued and processed);
+									// suppress the harmless "No such file" warning.
+									@unlink(CONS_TMP_PATH . $rCustomData['uuid']);
+									break;
+								case 'drop_con':
+									// A daemon-served viewer on this node was kicked
+									// from another (ConnectionTracker::dropDaemonViewer).
+									FanoutClient::dropConnection((string) ($rCustomData['uuid'] ?? ''));
+									break;
+								case 'delete_vod':
+									exec('rm ' . MAIN_HOME . 'content/vod/' . intval($rCustomData['id']) . '.*');
+									break;
+								case 'delete_vods':
+									foreach ($rCustomData['id'] as $rID) {
+										exec('rm ' . MAIN_HOME . 'content/vod/' . intval($rID) . '.*');
+									}
+									break;
+							}
+						}
+						if (count($rUpdatedStreams) > 0) {
+							shell_exec(PHP_BIN . ' ' . MAIN_HOME . 'console.php cron:cache_engine "streams_update" "' . implode(',', $rUpdatedStreams) . '"');
+						}
+						if (count($rUpdatedLines) > 0) {
+							shell_exec(PHP_BIN . ' ' . MAIN_HOME . 'console.php cron:cache_engine "lines_update" "' . implode(',', $rUpdatedLines) . '"');
+						}
+						if (count($rIDs) > 0) {
+							$db->query('DELETE FROM `signals` WHERE `signal_id` IN (' . implode(',', $rIDs) . ')');
+						}
+					}
+
+					// ── Redis kill-сигналы ──────────────────────
+					if (SettingsManager::get('redis_handler')) {
+						$rSignals = [];
+						foreach (RedisManager::instance()->sMembers('SIGNALS#' . SERVER_ID) as $rKey) {
+							$rSignals[] = $rKey;
+						}
+						if (count($rSignals) > 0) {
+							$rSignalData = RedisManager::instance()->mGet($rSignals);
+							$rIDs = [];
+							foreach ($rSignalData as $rData) {
+								$rRow = igbinary_unserialize($rData);
+								$rIDs[] = $rRow['key'];
+								$rPID = $rRow['pid'];
+								if (is_array($rRow['custom_data'] ?? null) && ($rRow['custom_data']['type'] ?? '') === 'drop_con') {
+									FanoutClient::dropConnection((string) ($rRow['custom_data']['uuid'] ?? ''));
+								} elseif ($rRow['rtmp'] == 0) {
+									if (!empty($rPID) && file_exists('/proc/' . $rPID) && is_numeric($rPID) && 0 < $rPID) {
+										shell_exec('kill -9 ' . intval($rPID));
+									}
+								} else {
+									shell_exec('wget --timeout=2 -O /dev/null -o /dev/null "' . $rServers[SERVER_ID]['rtmp_mport_url'] . 'control/drop/client?clientid=' . intval($rPID) . '" >/dev/null 2>/dev/null &');
+								}
+							}
+							RedisManager::instance()->multi()->del($rIDs)->sRem('SIGNALS#' . SERVER_ID, ...$rSignals)->exec();
+						}
+					}
+
+					usleep(250000);
+				}
+				break;
+			}
+		}
+
+		$this->restartDaemon('signals');
+		return 0;
+	}
+}

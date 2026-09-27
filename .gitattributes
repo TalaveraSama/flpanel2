@@ -1,0 +1,13 @@
+# Bundled binaries (ffmpeg/ffprobe, redis-server, yt-dlp, MaxMind DBs, guess,
+# login-bg.mp4) are stored as regular Git objects — NOT Git LFS.
+#
+# The former `filter=lfs` tracking rules were removed to stop consuming the
+# repository's Git LFS budget: plain-git clone bandwidth is not metered. These
+# are binary files — mark them so Git never tries to line-diff or merge them.
+src/bin/ffmpeg_bin/**                          -text -diff
+src/bin/maxmind/GeoIP2-ISP.mmdb                -text -diff
+src/bin/maxmind/cidr.db                        -text -diff
+src/bin/redis/redis-server                     -text -diff
+src/bin/guess                                  -text -diff
+src/bin/yt-dlp                                 -text -diff
+src/Public/assets/admin/videos/login-bg.mp4    -text -diff

@@ -1,0 +1,1672 @@
+<?php
+
+namespace XcVm\Public\Controllers\Api;
+
+use XcVm\Core\Auth\AuthRepository;
+use XcVm\Core\Auth\AuthService;
+use XcVm\Core\Cluster\NodeRpc;
+use XcVm\Core\Config\SettingsManager;
+use XcVm\Core\Http\ApiClient;
+use XcVm\Core\Http\RequestManager;
+use XcVm\Domain\Bouquet\BouquetService;
+use XcVm\Domain\Device\EnigmaService;
+use XcVm\Domain\Device\MagService;
+use XcVm\Domain\Epg\EpgService;
+use XcVm\Domain\Line\ActiveCodeService;
+use XcVm\Domain\Line\LineService;
+use XcVm\Domain\Line\PackageService;
+use XcVm\Domain\Security\BlocklistService;
+use XcVm\Domain\Server\ServerRepository;
+use XcVm\Domain\Server\ServerService;
+use XcVm\Domain\Server\SettingsService;
+use XcVm\Domain\Stream\CategoryService;
+use XcVm\Domain\Stream\ChannelService;
+use XcVm\Domain\Stream\ProfileService;
+use XcVm\Domain\Stream\ProviderService;
+use XcVm\Domain\Stream\RadioService;
+use XcVm\Domain\Stream\StreamConfigRepository;
+use XcVm\Domain\Stream\StreamRepository;
+use XcVm\Domain\Stream\StreamService;
+use XcVm\Domain\User\GroupService;
+use XcVm\Domain\User\UserRepository;
+use XcVm\Domain\User\UserService;
+use XcVm\Domain\Vod\EpisodeService;
+use XcVm\Domain\Vod\MovieService;
+use XcVm\Domain\Vod\SeriesService;
+use XcVm\Module\Watch\WatchService;
+use XcVm\Public\Controllers\Admin\TableController;
+
+class AdminAPIWrapper {
+	public static $db;
+
+	public static $rKey;
+
+	public static function filterRow($rData, $rShow, $rHide, $rSkipResult = false) {
+		if ($rShow || $rHide) {
+			if ($rSkipResult) {
+				$rRow = $rData;
+			} else {
+				$rRow = $rData['data'];
+			}
+			$rReturn = [];
+			if ($rRow) {
+				foreach (array_keys($rRow) as $rKey) {
+					if ($rShow) {
+						if (in_array($rKey, $rShow)) {
+							$rReturn[$rKey] = $rRow[$rKey];
+						}
+					} else {
+						if ($rHide) {
+							if (!in_array($rKey, $rHide)) {
+								$rReturn[$rKey] = $rRow[$rKey];
+							}
+						}
+					}
+				}
+			}
+			if ($rSkipResult) {
+				return $rReturn;
+			}
+			$rData['data'] = $rReturn;
+			return $rData;
+		}
+		return $rData;
+	}
+
+	public static function filterRows($rRows, $rShow, $rHide) {
+		$rReturn = [];
+		if ($rRows['data']) {
+			foreach ($rRows['data'] as $rRow) {
+				$rReturn[] = self::filterRow($rRow, $rShow, $rHide, true);
+			}
+		}
+		return $rReturn;
+	}
+
+	public static function TableAPI($rID, $rStart = 0, $rLimit = 10, $rData = [], $rShowColumns = [], $rHideColumns = []) {
+		// Historically this proxied over HTTP to `<code>/table.php` on the broadcast
+		// port. That path is dead under the Front Controller: `dirname(PHP_SELF)` now
+		// resolves to `/public`, nginx 404s every `*.php`, and — crucially — the
+		// api-scope access code routes *every* path back to AdminApiController (never
+		// TableController), so the round-trip could only ever return `null`.
+		//
+		// Dispatch the DataTables handler in-process instead. TableController::index()
+		// authenticates via `api_key`, renders the JSON for `$rID`, echoes it and
+		// exit()s — so this method emits the response directly and never returns.
+		$rData['api_key'] = self::$rKey;
+		$rData['id'] = $rID;
+		$rData['start'] = $rStart;
+		$rData['length'] = $rLimit;
+		$rData['show_columns'] = $rShowColumns;
+		$rData['hide_columns'] = $rHideColumns;
+		$rData['draw'] = 0;
+
+		RequestManager::set(array_merge(RequestManager::getAll(), $rData));
+		$_SERVER['HTTP_X_REQUESTED_WITH'] = 'xmlhttprequest';
+
+		(new TableController())->index();
+		return null; // unreachable: TableController::index() exit()s after echoing
+	}
+
+	public static function createSession() {
+		global $rUserInfo;
+		global $rPermissions;
+		self::$db->query('SELECT * FROM `users` LEFT JOIN `users_groups` ON `users_groups`.`group_id` = `users`.`member_group_id` WHERE `api_key` = ? AND LENGTH(`api_key`) > 0 AND `is_admin` = 1 AND `status` = 1;', self::$rKey);
+		if (0 >= self::$db->num_rows()) {
+			return false;
+		}
+		$rUserID = self::$db->get_row()['id'];
+		$GLOBALS['rAdminUserInfo'] = UserRepository::getRegisteredUserById($rUserID);
+		unset($GLOBALS['rAdminUserInfo']['password']);
+		$rUserInfo = $GLOBALS['rAdminUserInfo'];
+		$rPermissions = AuthRepository::getPermissions($rUserInfo['member_group_id']);
+		$rPermissions['advanced'] = [];
+		if ((string) $rUserInfo['timezone'] !== '') {
+			date_default_timezone_set($rUserInfo['timezone']);
+		}
+		return true;
+	}
+
+	public static function getUserInfo() {
+		global $rUserInfo;
+		global $rPermissions;
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rUserInfo, 'permissions' => $rPermissions];
+	}
+
+	public static function getLine($rID) {
+		if (!($rLine = UserRepository::getLineById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rLine];
+	}
+
+	public static function createLine($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(LineService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getLine($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editLine($rID, $rData) {
+		if (!($rLine = self::getLine($rID)) || !isset($rLine['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		if (isset($rData['isp_clear'])) {
+			$rData['isp_clear'] = '';
+		}
+		$rReturn = parseerror(LineService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getLine($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteLine($rID) {
+		if (($rLine = self::getLine($rID)) && isset($rLine['data'])) {
+			if (LineService::deleteLineById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function disableLine($rID) {
+		if (!($rLine = self::getLine($rID)) || !isset($rLine['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `enabled` = 0 WHERE `id` = ?;', $rID);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function enableLine($rID) {
+		if (!($rLine = self::getLine($rID)) || !isset($rLine['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `enabled` = 1 WHERE `id` = ?;', $rID);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function banLine($rID) {
+		if (!($rLine = self::getLine($rID)) || !isset($rLine['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `admin_enabled` = 0 WHERE `id` = ?;', $rID);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function unbanLine($rID) {
+		if (!($rLine = self::getLine($rID)) || !isset($rLine['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `admin_enabled` = 1 WHERE `id` = ?;', $rID);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getUser($rID) {
+		if (!($rUser = UserRepository::getRegisteredUserById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rUser];
+	}
+
+	public static function createUser($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(UserService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getUser($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editUser($rID, $rData) {
+		if (!($rUser = self::getUser($rID)) || !isset($rUser['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(UserService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getUser($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteUser($rID) {
+		if (($rUser = self::getUser($rID)) && isset($rUser['data'])) {
+			if (UserService::deleteRegisteredUser($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function disableUser($rID) {
+		if (!($rUser = self::getUser($rID)) || !isset($rUser['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `users` SET `status` = 0 WHERE `id` = ?;', $rID);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function enableUser($rID) {
+		if (!($rUser = self::getUser($rID)) || !isset($rUser['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `users` SET `status` = 1 WHERE `id` = ?;', $rID);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getMAG($rID) {
+		if (!($rDevice = MagService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rDevice];
+	}
+
+	public static function createMAG($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(MagService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getMAG($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editMAG($rID, $rData) {
+		if (!($rDevice = self::getMAG($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		if (isset($rData['isp_clear'])) {
+			$rData['isp_clear'] = '';
+		}
+		$rReturn = parseerror(MagService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getMAG($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteMAG($rID) {
+		if (($rDevice = self::getMAG($rID)) && isset($rDevice['data'])) {
+			if (MagService::deleteDevice($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	// getMAG()/getEnigma() return the device under `data`. These actions read
+	// $rDevice['user_id'] — always null — so they ran `WHERE id = NULL`, changed
+	// nothing and answered success; convert returned a failure object as its data.
+	public static function disableMAG($rID) {
+		if (!($rDevice = self::getMAG($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `enabled` = 0 WHERE `id` = ?;', $rDevice['data']['user_id']);
+		LineService::updateLineSignal($rDevice['data']['user_id']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function enableMAG($rID) {
+		if (!($rDevice = self::getMAG($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `enabled` = 1 WHERE `id` = ?;', $rDevice['data']['user_id']);
+		LineService::updateLineSignal($rDevice['data']['user_id']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function banMAG($rID) {
+		if (!($rDevice = self::getMAG($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `admin_enabled` = 0 WHERE `id` = ?;', $rDevice['data']['user_id']);
+		LineService::updateLineSignal($rDevice['data']['user_id']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function unbanMAG($rID) {
+		if (!($rDevice = self::getMAG($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `admin_enabled` = 1 WHERE `id` = ?;', $rDevice['data']['user_id']);
+		LineService::updateLineSignal($rDevice['data']['user_id']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function convertMAG($rID) {
+		if (!($rDevice = self::getMAG($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		MagService::deleteDevice($rID, false, false, true);
+		return ['status' => 'STATUS_SUCCESS', 'data' => self::getLine($rDevice['data']['user_id'])];
+	}
+
+	public static function getEnigma($rID) {
+		if (!($rDevice = EnigmaService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rDevice];
+	}
+
+	public static function createEnigma($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(EnigmaService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getEnigma($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editEnigma($rID, $rData) {
+		if (!($rDevice = self::getEnigma($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		if (isset($rData['isp_clear'])) {
+			$rData['isp_clear'] = '';
+		}
+		$rReturn = parseerror(EnigmaService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getEnigma($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteEnigma($rID) {
+		if (($rDevice = self::getEnigma($rID)) && isset($rDevice['data'])) {
+			if (EnigmaService::deleteDevice($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function disableEnigma($rID) {
+		if (!($rDevice = self::getEnigma($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `enabled` = 0 WHERE `id` = ?;', $rDevice['data']['user_id']);
+		LineService::updateLineSignal($rDevice['data']['user_id']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function enableEnigma($rID) {
+		if (!($rDevice = self::getEnigma($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `enabled` = 1 WHERE `id` = ?;', $rDevice['data']['user_id']);
+		LineService::updateLineSignal($rDevice['data']['user_id']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function banEnigma($rID) {
+		if (!($rDevice = self::getEnigma($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `admin_enabled` = 0 WHERE `id` = ?;', $rDevice['data']['user_id']);
+		LineService::updateLineSignal($rDevice['data']['user_id']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function unbanEnigma($rID) {
+		if (!($rDevice = self::getEnigma($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		self::$db->query('UPDATE `lines` SET `admin_enabled` = 1 WHERE `id` = ?;', $rDevice['data']['user_id']);
+		LineService::updateLineSignal($rDevice['data']['user_id']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function convertEnigma($rID) {
+		if (!($rDevice = self::getEnigma($rID)) || !isset($rDevice['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		EnigmaService::deleteDevice($rID, false, false, true);
+		return ['status' => 'STATUS_SUCCESS', 'data' => self::getLine($rDevice['data']['user_id'])];
+	}
+
+	public static function getBouquets() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => BouquetService::getAllSimple()];
+	}
+
+	public static function getBouquet($rID) {
+		if (!($rBouquet = BouquetService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rBouquet];
+	}
+
+	public static function createBouquet($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(BouquetService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getBouquet($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editBouquet($rID, $rData) {
+		if (!($rBouquet = self::getBouquet($rID)) || !isset($rBouquet['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(BouquetService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getBouquet($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteBouquet($rID) {
+		if (($rBouquet = self::getBouquet($rID)) && isset($rBouquet['data'])) {
+			if (BouquetService::deleteById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getAccessCodes() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => AuthRepository::getAllCodes()];
+	}
+
+	public static function getAccessCode($rID) {
+		if (!($rCode = AuthRepository::getCodeById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rCode];
+	}
+
+	public static function createAccessCode($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(AuthService::processCode($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getAccessCode($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editAccessCode($rID, $rData) {
+		if (!($rCode = self::getAccessCode($rID)) || !isset($rCode['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(AuthService::processCode($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getAccessCode($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteAccessCode($rID) {
+		if (($rCode = self::getAccessCode($rID)) && isset($rCode['data'])) {
+			if (AuthRepository::deleteCode($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getHMACs() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => AuthRepository::getAllHMAC()];
+	}
+
+	public static function getHMAC($rID) {
+		if (!($rToken = AuthRepository::getHMACById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rToken];
+	}
+
+	public static function createHMAC($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(AuthService::processHMAC($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getHMAC($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editHMAC($rID, $rData) {
+		if (!($rToken = self::getHMAC($rID)) || !isset($rToken['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(AuthService::processHMAC($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getHMAC($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteHMAC($rID) {
+		if (($rToken = self::getHMAC($rID)) && isset($rToken['data'])) {
+			if (AuthRepository::deleteHMAC($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getEPGs() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => EpgService::getAll()];
+	}
+
+	public static function getEPG($rID) {
+		if (!($rEPG = EpgService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rEPG];
+	}
+
+	public static function createEPG($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(EpgService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getEPG($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editEPG($rID, $rData) {
+		if (!($rEPG = self::getEPG($rID)) || !isset($rEPG['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(EpgService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getEPG($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteEPG($rID) {
+		if (($rEPG = self::getEPG($rID)) && isset($rEPG['data'])) {
+			if (EpgService::deleteEpgById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function reloadEPG($rID = null) {
+		if ($rID) {
+			shell_exec(PHP_BIN . ' ' . MAIN_HOME . 'console.php cron:epg "' . intval($rID) . '" > /dev/null 2>/dev/null &');
+		} else {
+			shell_exec(PHP_BIN . ' ' . MAIN_HOME . 'console.php cron:epg > /dev/null 2>/dev/null &');
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getProviders() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => ProviderService::getAll()];
+	}
+
+	public static function getProvider($rID) {
+		if (!($rProvider = ProviderService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rProvider];
+	}
+
+	public static function createProvider($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(ProviderService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getProvider($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editProvider($rID, $rData) {
+		if (!($rProvider = self::getProvider($rID)) || !isset($rProvider['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(ProviderService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getProvider($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteProvider($rID) {
+		if (($rProvider = self::getProvider($rID)) && isset($rProvider['data'])) {
+			if (ProviderService::deleteById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function reloadProvider($rID = null) {
+		if ($rID) {
+			shell_exec(PHP_BIN . ' ' . MAIN_HOME . 'console.php cron:providers "' . intval($rID) . '" > /dev/null 2>/dev/null &');
+		} else {
+			shell_exec(PHP_BIN . ' ' . MAIN_HOME . 'console.php cron:providers > /dev/null 2>/dev/null &');
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getGroups() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => GroupService::getAll()];
+	}
+
+	public static function getGroup($rID) {
+		if (!($rGroup = GroupService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rGroup];
+	}
+
+	public static function createGroup($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(GroupService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getGroup($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editGroup($rID, $rData) {
+		if (!($rGroup = self::getGroup($rID)) || !isset($rGroup['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(GroupService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getGroup($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteGroup($rID) {
+		if (($rGroup = self::getGroup($rID)) && isset($rGroup['data'])) {
+			if (GroupService::deleteById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getPackages() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => PackageService::getAll()];
+	}
+
+	public static function getPackage($rID) {
+		if (!($rPackage = PackageService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rPackage];
+	}
+
+	public static function createPackage($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(PackageService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getPackage($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editPackage($rID, $rData) {
+		if (!($rPackage = self::getPackage($rID)) || !isset($rPackage['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(PackageService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getPackage($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deletePackage($rID) {
+		if (($rPackage = self::getPackage($rID)) && isset($rPackage['data'])) {
+			if (PackageService::deleteById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getTranscodeProfiles() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => StreamConfigRepository::getTranscodeProfiles()];
+	}
+
+	public static function getTranscodeProfile($rID) {
+		if (!($rProfile = StreamConfigRepository::getTranscodeProfile($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rProfile];
+	}
+
+	public static function createTranscodeProfile($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(ProfileService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getTranscodeProfile($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editTranscodeProfile($rID, $rData) {
+		if (!($rProfile = self::getTranscodeProfile($rID)) || !isset($rProfile['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(ProfileService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getTranscodeProfile($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteTranscodeProfile($rID) {
+		if (($rProfile = self::getTranscodeProfile($rID)) && isset($rProfile['data'])) {
+			if (StreamConfigRepository::deleteProfile($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getRTMPIPs() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => BlocklistService::getRTMPIPsSimple()];
+	}
+
+	public static function getRTMPIP($rID) {
+		if (!($rIP = BlocklistService::getRTMPIPById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rIP];
+	}
+
+	public static function addRTMPIP($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(BlocklistService::processRTMPIP($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getRTMPIP($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editRTMPIP($rID, $rData) {
+		if (!($rIP = self::getRTMPIP($rID)) || !isset($rIP['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(BlocklistService::processRTMPIP($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getRTMPIP($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteRTMPIP($rID) {
+		if (($rIP = self::getRTMPIP($rID)) && isset($rIP['data'])) {
+			if (BlocklistService::deleteRTMPIP($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getCategories() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => CategoryService::getAllByType()];
+	}
+
+	public static function getCategory($rID) {
+		if (!($rCategory = CategoryService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rCategory];
+	}
+
+	public static function createCategory($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(CategoryService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getCategory($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editCategory($rID, $rData) {
+		if (!($rCategory = self::getCategory($rID)) || !isset($rCategory['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(CategoryService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getCategory($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteCategory($rID) {
+		if (($rCategory = self::getCategory($rID)) && isset($rCategory['data'])) {
+			if (CategoryService::deleteById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getWatchFolders() {
+		// watch is an optional module — report failure cleanly when it is absent.
+		if (!class_exists(WatchService::class)) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => WatchService::getWatchFolders()];
+	}
+
+	public static function getWatchFolder($rID) {
+		if (!($rFolder = StreamRepository::getWatchFolder($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rFolder];
+	}
+
+	public static function createWatchFolder($rData) {
+		if (!class_exists(WatchService::class)) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(WatchService::processWatchFolder($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getWatchFolder($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editWatchFolder($rID, $rData) {
+		if (!class_exists(WatchService::class)) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		if (!($rFolder = self::getWatchFolder($rID)) || !isset($rFolder['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(WatchService::processWatchFolder($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getWatchFolder($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteWatchFolder($rID) {
+		if (($rFolder = self::getWatchFolder($rID)) && isset($rFolder['data'])) {
+			if (StreamRepository::deleteWatchFolder($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function reloadWatchFolder($rServerID, $rID) {
+		if (!class_exists(WatchService::class)) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		WatchService::forceWatch($rServerID, $rID);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getBlockedISPs() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => BlocklistService::getAllISPs()];
+	}
+
+	public static function addBlockedISP($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(BlocklistService::processISP($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = $rReturn['data']['insert_id'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteBlockedISP($rID) {
+		if (!BlocklistService::deleteBlockedISP($rID)) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getBlockedUAs() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => BlocklistService::getAllUserAgents()];
+	}
+
+	public static function addBlockedUA($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(BlocklistService::processUA($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = $rReturn['data']['insert_id'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteBlockedUA($rID) {
+		if (!BlocklistService::deleteBlockedUA($rID)) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getBlockedIPs() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => BlocklistService::getBlockedIPsSimple()];
+	}
+
+	public static function addBlockedIP($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(BlocklistService::blockIP($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = $rReturn['data']['insert_id'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteBlockedIP($rID) {
+		if (!BlocklistService::deleteBlockedIP($rID)) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function flushBlockedIPs() {
+		BlocklistService::flushIPs();
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getStream($rID) {
+		if (!($rStream = StreamRepository::getById($rID)) || $rStream['type'] != 1) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rStream];
+	}
+
+	public static function createStream($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(StreamService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getStream($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editStream($rID, $rData) {
+		if (!($rStream = self::getStream($rID)) || !isset($rStream['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(StreamService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getStream($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteStream($rID, $rServerID = -1) {
+		if (($rStream = self::getStream($rID)) && isset($rStream['data'])) {
+			if (StreamRepository::deleteStream($rID, $rServerID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function startStream($rID, $rServerID = -1) {
+		if ($rServerID == -1) {
+			$rData = json_decode(ApiClient::request(['action' => 'stream', 'sub' => 'start', 'stream_ids' => [$rID], 'servers' => array_keys(ServerRepository::getAll())]), true);
+		} else {
+			$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'stream', 'stream_ids' => [$rID], 'function' => 'start']), true);
+		}
+		if (!$rData['result']) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function stopStream($rID, $rServerID = -1) {
+		if ($rServerID == -1) {
+			$rData = json_decode(ApiClient::request(['action' => 'stream', 'sub' => 'stop', 'stream_ids' => [$rID], 'servers' => array_keys(ServerRepository::getAll())]), true);
+		} else {
+			$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'stream', 'stream_ids' => [$rID], 'function' => 'stop']), true);
+		}
+		if (!$rData['result']) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getChannel($rID) {
+		if (!($rStream = StreamRepository::getById($rID)) || $rStream['type'] != 3) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rStream];
+	}
+
+	public static function createChannel($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(ChannelService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getChannel($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editChannel($rID, $rData) {
+		if (!($rStream = self::getChannel($rID)) || !isset($rStream['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(ChannelService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getChannel($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteChannel($rID, $rServerID = -1) {
+		if (($rStream = self::getChannel($rID)) && isset($rStream['data'])) {
+			if (StreamRepository::deleteStream($rID, $rServerID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getStation($rID) {
+		if (!($rStream = StreamRepository::getById($rID)) || $rStream['type'] != 4) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rStream];
+	}
+
+	public static function createStation($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(RadioService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getStation($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editStation($rID, $rData) {
+		if (!($rStream = self::getStation($rID)) || !isset($rStream['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(RadioService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getStation($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteStation($rID, $rServerID = -1) {
+		if (($rStream = self::getStation($rID)) && isset($rStream['data'])) {
+			if (StreamRepository::deleteStream($rID, $rServerID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getMovie($rID) {
+		if (!($rStream = StreamRepository::getById($rID)) || $rStream['type'] != 2) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rStream];
+	}
+
+	public static function createMovie($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(MovieService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getMovie($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editMovie($rID, $rData) {
+		if (!($rStream = self::getMovie($rID)) || !isset($rStream['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(MovieService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getMovie($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteMovie($rID, $rServerID = -1) {
+		if (($rStream = self::getMovie($rID)) && isset($rStream['data'])) {
+			if (StreamRepository::deleteStream($rID, $rServerID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function startMovie($rID, $rServerID = -1) {
+		if ($rServerID == -1) {
+			$rData = json_decode(ApiClient::request(['action' => 'vod', 'sub' => 'start', 'stream_ids' => [$rID], 'servers' => array_keys(ServerRepository::getAll())]), true);
+		} else {
+			$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'vod', 'stream_ids' => [$rID], 'function' => 'start']), true);
+		}
+		if (!$rData['result']) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function stopMovie($rID, $rServerID = -1) {
+		if ($rServerID == -1) {
+			$rData = json_decode(ApiClient::request(['action' => 'vod', 'sub' => 'stop', 'stream_ids' => [$rID], 'servers' => array_keys(ServerRepository::getAll())]), true);
+		} else {
+			$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'vod', 'stream_ids' => [$rID], 'function' => 'stop']), true);
+		}
+		if (!$rData['result']) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getEpisode($rID) {
+		if (!($rStream = StreamRepository::getById($rID)) || $rStream['type'] != 5) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rStream];
+	}
+
+	public static function createEpisode($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(EpisodeService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getEpisode($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editEpisode($rID, $rData) {
+		if (!($rStream = self::getEpisode($rID)) || !isset($rStream['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(EpisodeService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getEpisode($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteEpisode($rID, $rServerID = -1) {
+		if (($rStream = self::getEpisode($rID)) && isset($rStream['data'])) {
+			if (StreamRepository::deleteStream($rID, $rServerID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getSeries($rID) {
+		if (!($rSeries = SeriesService::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rSeries];
+	}
+
+	public static function createSeries($rData) {
+		if (isset($rData['edit'])) {
+			unset($rData['edit']);
+		}
+		$rReturn = parseerror(SeriesService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getSeries($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editSeries($rID, $rData) {
+		if (!($rStream = self::getSeries($rID)) || !isset($rStream['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(SeriesService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getSeries($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteSeries($rID) {
+		if (($rStream = self::getSeries($rID)) && isset($rStream['data'])) {
+			if (SeriesService::deleteSeriesById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getServers() {
+		global $rPermissions;
+		return ['status' => 'STATUS_SUCCESS', 'data' => ServerRepository::getStreamingSimple($rPermissions)];
+	}
+
+	public static function getServer($rID) {
+		if (!($rServer = ServerRepository::getById($rID))) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		// Worker pid list, left out as in get_servers.
+		unset($rServer['php_pids']);
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rServer];
+	}
+
+	public static function installServer($rData) {
+		global $rPermissions;
+		if (!(empty($rData['type']) || empty($rData['ssh_port']) || empty($rData['root_username']) || empty($rData['root_password']))) {
+			if ($rData['type'] != 1 || !empty($rData['type']) && !empty($rData['ssh_port'])) {
+				$rReturn = parseerror(ServerService::install($rData, ServerRepository::getStreamingSimple($rPermissions, 'all'), ServerRepository::getProxySimple($rPermissions)));
+				if (isset($rReturn['data']['insert_id'])) {
+					$rReturn['data'] = self::getServer($rReturn['data']['insert_id']);
+				}
+				return ['status' => 'STATUS_FAILURE'];
+			}
+			return ['status' => 'STATUS_INVALID_INPUT'];
+		}
+		return ['status' => 'STATUS_INVALID_INPUT'];
+	}
+
+	public static function editServer($rID, $rData) {
+		if (!($rServer = self::getServer($rID)) || !isset($rServer['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(ServerService::process($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getServer($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function editProxy($rID, $rData) {
+		if (!($rServer = self::getServer($rID)) || !isset($rServer['data'])) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['edit'] = $rID;
+		$rReturn = parseerror(ServerService::processProxy($rData));
+		if (isset($rReturn['data']['insert_id'])) {
+			$rReturn['data'] = self::getServer($rReturn['data']['insert_id'])['data'];
+		}
+		return $rReturn;
+	}
+
+	public static function deleteServer($rID) {
+		if (($rServer = self::getServer($rID)) && isset($rServer['data'])) {
+			if (ServerRepository::deleteById($rID)) {
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function getSettings() {
+		return ['status' => 'STATUS_SUCCESS', 'data' => SettingsManager::getAll()];
+	}
+
+	public static function editSettings($rData) {
+		$rReturn = parseerror(SettingsService::edit($rData));
+		$rReturn['data'] = self::getSettings()['data'];
+		return $rReturn;
+	}
+
+	public static function getStats($rServerID) {
+		global $db;
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'stats']), true);
+		if (!$rData) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		$rData['requests_per_second'] = ServerRepository::getAll()[$rServerID]['requests_per_second'];
+		$db->query('SELECT COUNT(*) AS `count` FROM `lines_live` WHERE `server_id` = ? AND `hls_end` = 0;', $rServerID);
+		if (0 < $db->num_rows()) {
+			$rData['open_connections'] = $db->get_row()['count'];
+		}
+		$db->query('SELECT COUNT(*) AS `count` FROM `lines_live` WHERE `hls_end` = 0;');
+		if (0 < $db->num_rows()) {
+			$rData['total_connections'] = $db->get_row()['count'];
+		}
+		$db->query('SELECT `activity_id` FROM `lines_live` WHERE `server_id` = ? AND `hls_end` = 0 GROUP BY `user_id`;', $rServerID);
+		if (0 < $db->num_rows()) {
+			$rData['online_users'] = $db->num_rows();
+		}
+		$db->query('SELECT `activity_id` FROM `lines_live` WHERE `hls_end` = 0 GROUP BY `user_id`;');
+		if (0 < $db->num_rows()) {
+			$rData['total_users'] = $db->num_rows();
+		}
+		$db->query('SELECT COUNT(*) AS `count` FROM `streams_servers` LEFT JOIN `streams` ON `streams`.`id` = `streams_servers`.`stream_id` WHERE `server_id` = ? AND `stream_status` <> 2 AND `type` = 1;', $rServerID);
+		if (0 < $db->num_rows()) {
+			$rData['total_streams'] = $db->get_row()['count'];
+		}
+		$db->query('SELECT COUNT(*) AS `count` FROM `streams_servers` LEFT JOIN `streams` ON `streams`.`id` = `streams_servers`.`stream_id` WHERE `server_id` = ? AND `pid` > 0 AND `type` = 1;', $rServerID);
+		if (0 < $db->num_rows()) {
+			$rData['total_running_streams'] = $db->get_row()['count'];
+		}
+		$db->query('SELECT COUNT(*) AS `count` FROM `streams_servers` LEFT JOIN `streams` ON `streams`.`id` = `streams_servers`.`stream_id` WHERE `server_id` = ? AND `type` = 1 AND (`streams`.`direct_source` = 0 AND (`streams_servers`.`monitor_pid` IS NOT NULL AND `streams_servers`.`monitor_pid` > 0) AND (`streams_servers`.`pid` IS NULL OR `streams_servers`.`pid` <= 0) AND `streams_servers`.`stream_status` <> 0);', $rServerID);
+		if (0 < $db->num_rows()) {
+			$rData['offline_streams'] = $db->get_row()['count'];
+		}
+		$rData['network_guaranteed_speed'] = ServerRepository::getAll()[$rServerID]['network_guaranteed_speed'];
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rData];
+	}
+
+	public static function getFPMStatus($rServerID) {
+		$rData = NodeRpc::request($rServerID, ['action' => 'fpm_status']);
+		if (!$rData) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rData];
+	}
+
+	public static function getRTMPStats($rServerID) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'rtmp_stats']), true);
+		if (!$rData) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rData];
+	}
+
+	public static function getFreeSpace($rServerID) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'get_free_space']), true);
+		if (!$rData) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rData];
+	}
+
+	public static function getPIDs($rServerID) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'get_pids']), true);
+		if (!$rData) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rData];
+	}
+
+	public static function getCertificateInfo($rServerID) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'get_certificate_info']), true);
+		if (!$rData) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $rData];
+	}
+
+	public static function reloadNGINX($rServerID) {
+		NodeRpc::request($rServerID, ['action' => 'reload_nginx']);
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function clearTemp($rServerID) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'free_temp']), true);
+		if (!$rData['result']) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function clearStreams($rServerID) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'free_streams']), true);
+		if (!$rData['result']) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function getDirectory($rServerID, $rDirectory) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'scandir', 'dir' => $rDirectory]), true);
+		if (!$rData) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		unset($rData['result']);
+		if (!isset($rData['result']) || $rData['result']) {
+			return ['status' => 'STATUS_SUCCESS', 'data' => $rData];
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function killPID($rServerID, $rPID) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'kill_pid', 'pid' => intval($rPID)]), true);
+		if (!$rData['result']) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function killConnection($rServerID, $rActivityID) {
+		$rData = json_decode(NodeRpc::request($rServerID, ['action' => 'closeConnection', 'activity_id' => intval($rActivityID)]), true);
+		if (!$rData['result']) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function adjustCredits($rID, $rCredits, $rReason = '') {
+		global $db;
+		global $rUserInfo;
+		if (is_numeric($rCredits) && ($rUser = self::getUser($rID)) && isset($rUser['data'])) {
+			$rCredits = intval($rUser['data']['credits']) + intval($rCredits);
+			if (0 <= $rCredits) {
+				$db->query('UPDATE `users` SET `credits` = ? WHERE `id` = ?;', $rCredits, $rID);
+				$db->query('INSERT INTO `users_credits_logs`(`target_id`, `admin_id`, `amount`, `date`, `reason`) VALUES(?, ?, ?, ?, ?);', $rID, $rUserInfo['id'], $rCredits, time(), $rReason);
+				return ['status' => 'STATUS_SUCCESS'];
+			}
+		}
+		return ['status' => 'STATUS_FAILURE'];
+	}
+
+	public static function reloadCache() {
+		shell_exec(PHP_BIN . ' ' . MAIN_HOME . 'console.php cron:cache_engine > /dev/null 2>/dev/null &');
+		return ['status' => 'STATUS_SUCCESS'];
+	}
+
+	public static function runQuery($rQuery) {
+		global $db;
+		if (!$db->query($rQuery)) {
+			return ['status' => 'STATUS_FAILURE'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $db->get_rows(), 'insert_id' => $db->last_insert_id()];
+	}
+
+	// ─── Active Codes API Handlers ──────────────────────────────────────────
+
+	public static function getActiveCodes($rStart = 0, $rLimit = 50, $rData = [], $rShowColumns = null, $rHideColumns = null) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$res = ActiveCodeService::listCodes($rData, $user, true, (int) $rStart, (int) $rLimit);
+		return [
+			'status' => 'STATUS_SUCCESS',
+			'total' => $res['total'],
+			'count' => $res['count'],
+			'start' => $res['start'],
+			'limit' => $res['limit'],
+			'data' => self::filterRows(['data' => $res['data']], $rShowColumns, $rHideColumns),
+		];
+	}
+
+	public static function getActiveCode($rID) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$code = ActiveCodeService::getCodeDetails($rID, $user, true);
+		if (!$code) {
+			return ['status' => 'STATUS_FAILURE', 'error' => 'Active code not found.'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $code];
+	}
+
+	public static function generateActiveCodes($rData) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$res = ActiveCodeService::generateCodes($rData, $user, true);
+		if ($res['status'] !== 'SUCCESS') {
+			return ['status' => 'STATUS_FAILURE', 'error' => $res['message'] ?? 'Failed to generate active codes.'];
+		}
+		return [
+			'status' => 'STATUS_SUCCESS',
+			'message' => $res['message'],
+			'batch_name' => $res['batch_name'],
+			'qty' => $res['qty'],
+			'data' => $res['codes'],
+		];
+	}
+
+	public static function editActiveCode($rID, $rData) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$res = ActiveCodeService::updateCode((int) $rID, $rData, $user, true);
+		if ($res['status'] !== 'SUCCESS') {
+			return ['status' => 'STATUS_FAILURE', 'error' => $res['message'] ?? 'Failed to update active code.'];
+		}
+		return [
+			'status' => 'STATUS_SUCCESS',
+			'message' => $res['message'],
+			'data' => ActiveCodeService::getCodeDetails((int) $rID, $user, true),
+		];
+	}
+
+	public static function deleteActiveCode($rID) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$res = ActiveCodeService::deleteCode((int) $rID, $user, true, false);
+		if ($res['status'] !== 'SUCCESS') {
+			return ['status' => 'STATUS_FAILURE', 'error' => $res['message'] ?? 'Failed to delete active code.'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'message' => $res['message']];
+	}
+
+	public static function enableActiveCode($rID) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$res = ActiveCodeService::massAction('enable', [(int) $rID], $user, true);
+		if ($res['status'] !== 'SUCCESS') {
+			return ['status' => 'STATUS_FAILURE', 'error' => $res['message'] ?? 'Failed to enable active code.'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'message' => $res['message']];
+	}
+
+	public static function disableActiveCode($rID) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$res = ActiveCodeService::massAction('disable', [(int) $rID], $user, true);
+		if ($res['status'] !== 'SUCCESS') {
+			return ['status' => 'STATUS_FAILURE', 'error' => $res['message'] ?? 'Failed to disable active code.'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'message' => $res['message']];
+	}
+
+	public static function resetActiveCodeDevice($rID) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$res = ActiveCodeService::resetDevice($rID, $user, true);
+		if ($res['status'] !== 'SUCCESS') {
+			return ['status' => 'STATUS_FAILURE', 'error' => $res['message'] ?? 'Failed to reset device lock.'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'message' => $res['message']];
+	}
+
+	public static function massActiveCodes($rAction, $rIDs, $rExtra = []) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		if (is_string($rIDs)) {
+			$rIDs = explode(',', $rIDs);
+		}
+		$rIDs = array_filter(array_map('intval', (array) $rIDs));
+		if ($rIDs === []) {
+			return ['status' => 'STATUS_FAILURE', 'error' => 'No active code IDs provided.'];
+		}
+		$res = ActiveCodeService::massAction((string) $rAction, $rIDs, $user, true, (array) $rExtra);
+		if ($res['status'] !== 'SUCCESS') {
+			return ['status' => 'STATUS_FAILURE', 'error' => $res['message'] ?? 'Mass action failed.'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'message' => $res['message']];
+	}
+
+	public static function getActiveCodesBatches($rBatchName = null) {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		$batches = ActiveCodeService::getBatchSummary($user, true, $rBatchName);
+		return ['status' => 'STATUS_SUCCESS', 'data' => $batches];
+	}
+
+	public static function exportActiveCodeBatch($rBatchName, $rFormat = 'json') {
+		$user = $GLOBALS['rAdminUserInfo'] ?? ['id' => 1, 'username' => 'Admin'];
+		if (empty($rBatchName)) {
+			return ['status' => 'STATUS_FAILURE', 'error' => 'Batch name is required.'];
+		}
+		if (strtolower((string) $rFormat) === 'txt' || strtolower((string) $rFormat) === 'text') {
+			$txt = ActiveCodeService::exportBatchTxt((string) $rBatchName, $user, true);
+			return ['status' => 'STATUS_SUCCESS', 'format' => 'txt', 'content' => $txt];
+		}
+		$json = ActiveCodeService::exportBatchJson((string) $rBatchName, $user, true);
+		return ['status' => 'STATUS_SUCCESS', 'format' => 'json', 'data' => $json];
+	}
+
+	public static function checkActiveCode($rCode) {
+		$details = ActiveCodeService::checkCode((string) $rCode);
+		if ($details === []) {
+			return ['status' => 'STATUS_FAILURE', 'error' => 'Invalid or inactive code.'];
+		}
+		return ['status' => 'STATUS_SUCCESS', 'data' => $details];
+	}
+}
+
+if (!function_exists(__NAMESPACE__ . '\\parseError') && !function_exists('parseError')) {
+	function parseError($rArray) {
+		global $_ERRORS;
+		if (isset($rArray['status']) && is_numeric($rArray['status'])) {
+			$rArray['status'] = $_ERRORS[$rArray['status']];
+		}
+		if (!$rArray) {
+			$rArray['status'] = 'STATUS_NO_PERMISSIONS';
+		}
+		return $rArray;
+	}
+}

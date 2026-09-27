@@ -1,0 +1,55 @@
+name: Other
+description: For issues that don't fit other categories. Please do NOT create blank issues.
+title: "[OTHER]: "
+labels: ["awaiting triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before you continue
+        Please search our [open/closed issues](https://github.com/Vateron-Media/XC_VM/issues?q=is%3Aissue) to see if a similar issue has been addressed.
+
+  - type: checkboxes
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I have searched existing issues and confirmed this is not a duplicate.
+          required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: What best describes your issue?
+      options:
+        - "Question / How-to"
+        - "Configuration help"
+        - "Performance issue"
+        - "Compatibility issue"
+        - "Migration / Upgrade"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: XC_VM Version (if applicable)
+      description: "Leave empty if not relevant."
+      placeholder: "e.g. 2.0.1"
+    validations:
+      required: false
+
+  - type: textarea
+    id: issuedescription
+    attributes:
+      label: Description
+      description: Provide a clear and concise explanation of your issue.
+    validations:
+      required: true
+
+  - type: textarea
+    id: extrainfo
+    attributes:
+      label: Additional Information
+      description: Logs, screenshots, environment details, or anything else relevant.

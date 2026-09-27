@@ -1,0 +1,168 @@
+name: CI
+
+# Quality gate: runs on pushes to main and on every pull request.
+# Tests run via the committed PHAR (tests/phpunit.phar). Class loading uses
+# the committed Composer PSR-4 autoloader (src/vendor/) first, with the legacy
+# src/autoload.php scanner as an end-of-queue fallback. The deploy path ships
+# vendor/ as-is and never runs `composer install`.
+
+# `push` is scoped to main so a commit on a PR branch does NOT run the workflow
+# twice (once for push, once for pull_request); PR branches are covered by the
+# pull_request trigger. The concurrency group cancels superseded in-flight runs
+# on rapid re-pushes / new commits to the same ref.
+#
+# `paths-ignore` (blocklist, NOT an allowlist) skips CI only when EVERY changed
+# file is documentation. Any commit that also touches code still runs the full
+# gate — so this can never silently disable checks for a real source change. Do
+# not switch this to a `src/**` allowlist: the result also depends on tools/,
+# tests/, Makefile, composer.json/lock, build/phpcs.xml.dist and build/phpstan.dist.neon.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  phpstan:
+    name: PHPStan (static analysis)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          # Matches phpVersion (80300) the analysis targets.
+          php-version: '8.3'
+          coverage: none
+          tools: composer:v2
+
+      # The committed src/vendor/ is production-only; PHPStan is a require-dev
+      # tool, so install it here (from the committed lock — reproducible).
+      - name: Install dev dependencies
+        run: composer install --no-interaction --working-dir=src
+
+      # Analyses against the committed baseline — fails only on NEW issues.
+      - name: Run PHPStan
+        run: make phpstan
+
+  code-style:
+    name: Code Style (phpcs + Slevomat)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          tools: composer:v2
+
+      # phpcs + Slevomat are require-dev tools; the committed src/vendor/ is
+      # production-only, so install them here (from the committed lock). The
+      # phpcodesniffer-composer-installer plugin is allow-listed in composer.json.
+      - name: Install dev dependencies
+        run: composer install --no-interaction --working-dir=src
+
+      # Narrow ruleset: import / namespace hygiene only (see build/phpcs.xml.dist).
+      # phpcs exits non-zero on any violation.
+      - name: Run phpcs
+        run: make cs
+
+  psr4-gates:
+    name: PSR-4 Regression Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # Full history not needed, but git ls-files requires the working tree.
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      # check-procedural-use: procedural/view files must import every migrated
+      #   class they use (top-of-file `use`; PHP imports are positional).
+      # verify-lb-archive: the LoadBalancer archive must exclude privileged code
+      #   (security blocker 1 — silent rm misses after the PascalCase rename).
+      - name: Run PSR-4 gates
+        run: make gates
+
+  composer-audit:
+    name: Composer Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          coverage: none
+          tools: composer:v2
+
+      # Audits the committed install set (src/vendor/composer/installed.json)
+      # against the Packagist advisory database. Does NOT run `composer install`
+      # (vendor/ is committed and shipped) and does NOT use --locked
+      # (composer.lock is gitignored, never committed). A no-op while every
+      # dependency is path-mapped/vendored without metadata, but gates real
+      # installed packages the moment any are added.
+      - name: Composer audit
+        run: |
+          count=$(php -r '$f="src/vendor/composer/installed.json";$d=is_file($f)?json_decode(file_get_contents($f),true):[];echo is_array($d["packages"]??null)?count($d["packages"]):0;')
+          if [ "$count" -eq 0 ]; then
+            echo "No installed Composer packages — nothing to audit."
+          else
+            composer audit --no-interaction --working-dir=src
+          fi
+
+  test:
+    name: PHPUnit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          coverage: pcov
+
+      - name: Run unit tests
+        run: php tests/phpunit.phar -c tests/phpunit.xml.dist
+
+      - name: Coverage report
+        run: |
+          php tests/phpunit.phar -c tests/phpunit.xml.dist \
+            --coverage-text \
+            --coverage-clover coverage.xml
+        continue-on-error: true
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore

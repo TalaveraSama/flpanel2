@@ -1,0 +1,328 @@
+<?php
+
+use XcVm\Core\Auth\AuthService;
+use XcVm\Core\Config\SettingsManager;
+use XcVm\Core\Database\DatabaseHandler;
+use XcVm\Core\Http\RequestManager;
+use XcVm\Core\Process\ProcessManager;
+use XcVm\Core\Util\NetworkUtils;
+use XcVm\Core\Util\StreamUtils;
+use XcVm\Domain\Server\ServerRepository;
+use XcVm\Domain\Stream\AdminStreamToken;
+use XcVm\Domain\Stream\ConnectionTracker;
+use XcVm\Domain\Stream\StreamProcess;
+use XcVm\Infrastructure\Database\DatabaseFactory;
+
+/**
+ * Admin live stream handler
+ *
+ * @package XC_VM_Web_Admin
+ * @author  Divarion_D <https://github.com/Divarion-D>
+ * @copyright 2025-2026 Vateron Media
+ * @link    https://github.com/Vateron-Media/XC_VM
+ * @license AGPL-3.0 https://www.gnu.org/licenses/agpl-3.0.html
+ */
+
+register_shutdown_function('shutdown');
+header('Access-Control-Allow-Origin: *');
+set_time_limit(0);
+$rIP = NetworkUtils::getUserIP();
+$rPID = getmypid();
+$rSegmentSettings = ['seg_time' => intval(SettingsManager::get('seg_time')), 'seg_list_size' => intval(SettingsManager::get('seg_list_size')), 'seg_delete_threshold' => intval(SettingsManager::get('seg_delete_threshold'))];
+
+if (SettingsManager::get('use_buffer') == 0) {
+	header('X-Accel-Buffering: no');
+}
+
+if (!empty(RequestManager::get('uitoken'))) {
+	$rToken = AdminStreamToken::decode(RequestManager::get('uitoken'), SettingsManager::get('live_streaming_pass'), !SettingsManager::get('secure_stream_tokens'));
+
+	if ($rToken === null || !$rToken->isValid((bool) SettingsManager::get('ip_subnet_match'), $rIP)) {
+		generate404();
+	}
+
+	RequestManager::update('stream', $rToken->streamId);
+	RequestManager::update('extension', 'm3u8');
+	$rPrebuffer = $rSegmentSettings['seg_time'];
+} elseif (!AuthService::secretMatches(SettingsManager::get('live_streaming_pass'), RequestManager::get('password'))) {
+	generate404();
+} elseif (!in_array($rIP, ServerRepository::getAllowedIPs())) {
+	generate404();
+} else {
+	$rPrebuffer = (RequestManager::has('prebuffer') ? $rSegmentSettings['seg_time'] : 0);
+
+	foreach (getallheaders() as $rKey => $rValue) {
+		if (strtoupper($rKey) == 'X-XC_VM-PREBUFFER') {
+			$rPrebuffer = $rSegmentSettings['seg_time'];
+		}
+	}
+}
+
+$db = new DatabaseHandler();
+DatabaseFactory::set($db);
+$rPassword = SettingsManager::get('live_streaming_pass');
+$rStreamID = intval(RequestManager::get('stream'));
+$rExtension = RequestManager::get('extension');
+$rWaitTime = 20;
+$db->query('SELECT * FROM `streams` t1 INNER JOIN `streams_servers` t2 ON t2.stream_id = t1.id AND t2.server_id = ? WHERE t1.`id` = ?', SERVER_ID, $rStreamID);
+
+if (0 < $db->num_rows()) {
+	touch(SIGNALS_TMP_PATH . 'admin_' . intval($rStreamID));
+	$rChannelInfo = $db->get_row();
+	$db->close_mysql();
+
+	if (file_exists(STREAMS_PATH . $rStreamID . '_.pid')) {
+		$rChannelInfo['pid'] = intval(file_get_contents(STREAMS_PATH . $rStreamID . '_.pid'));
+	}
+
+	if (file_exists(STREAMS_PATH . $rStreamID . '_.monitor')) {
+		$rChannelInfo['monitor_pid'] = intval(file_get_contents(STREAMS_PATH . $rStreamID . '_.monitor'));
+	}
+
+	if ((SettingsManager::get('on_demand_instant_off') && $rChannelInfo['on_demand'] == 1)) {
+		ConnectionTracker::addToQueue($rStreamID, $rPID);
+	}
+
+	if (!ProcessManager::isStreamRunning($rChannelInfo['pid'], $rStreamID)) {
+		$rChannelInfo['pid'] = null;
+
+		if ($rChannelInfo['on_demand'] == 1) {
+			if (!StreamProcess::isWatched($rStreamID, $rChannelInfo['monitor_pid'])) {
+				DatabaseFactory::connect(); // closed above; the hand-over reads the stream's config
+				if (StreamProcess::startMonitor($rStreamID) === StreamProcess::MONITOR_FANOUT) {
+					// The daemon is the monitor, and writes no _.monitor file.
+					$rChannelInfo['monitor_pid'] = -1;
+				} else {
+					for ($rRetries = 0; !file_exists(STREAMS_PATH . intval($rStreamID) . '_.monitor') && $rRetries < 300; $rRetries++) {
+						usleep(10000);
+					}
+					$rChannelInfo['monitor_pid'] = intval(@file_get_contents(STREAMS_PATH . $rStreamID . '_.monitor'));
+				}
+			}
+		} else {
+			generate404();
+		}
+	}
+
+	$rRetries = 0;
+	$rPlaylist = STREAMS_PATH . $rStreamID . '_.m3u8';
+
+	if ($rExtension == 'ts') {
+		if (!file_exists($rPlaylist)) {
+			$rFirstTS = STREAMS_PATH . $rStreamID . '_0.ts';
+			$rFP = null;
+
+			while ($rRetries < intval($rWaitTime) * 100) {
+				if (file_exists($rFirstTS) && !$rFP) {
+					$rFP = fopen($rFirstTS, 'r');
+				}
+
+				if (!($rFP && fread($rFP, 1))) {
+					usleep(10000);
+					$rRetries++;
+
+					break;
+				}
+			}
+
+			if ($rFP) {
+				fclose($rFP);
+			}
+		}
+	} else {
+		$rFirstTS = STREAMS_PATH . $rStreamID . '_.m3u8';
+
+		while (!file_exists($rPlaylist) && !file_exists($rFirstTS) && $rRetries < intval($rWaitTime) * 100) {
+			usleep(10000);
+			$rRetries++;
+		}
+	}
+
+	if ($rRetries == intval($rWaitTime) * 10) {
+		if (RequestManager::has('odstart')) {
+			echo '0';
+
+			exit();
+		}
+
+		generate404();
+	} else {
+		if (RequestManager::has('odstart')) {
+			echo '1';
+
+			exit();
+		}
+	}
+
+	if (!$rChannelInfo['pid']) {
+		$rChannelInfo['pid'] = intval(file_get_contents(STREAMS_PATH . $rStreamID . '_.pid'));
+	}
+
+	switch ($rExtension) {
+		case 'm3u8':
+			if (StreamUtils::isValidStream($rPlaylist, $rChannelInfo['pid'])) {
+				if (empty(RequestManager::get('segment'))) {
+					if (($rSource = StreamUtils::generateAdminHLS($rPlaylist, $rPassword, $rStreamID, RequestManager::get('uitoken')))) {
+						header('Content-Type: application/vnd.apple.mpegurl');
+						header('Content-Length: ' . strlen($rSource));
+						ob_end_flush();
+						echo $rSource;
+
+						exit();
+					}
+				} else {
+					$rSegment = STREAMS_PATH . StreamUtils::sanitizeSegmentName(RequestManager::get('segment'));
+
+					if (file_exists($rSegment)) {
+						$rBytes = filesize($rSegment);
+						header('Content-Length: ' . $rBytes);
+						header('Content-Type: video/mp2t');
+						readfile($rSegment);
+
+						exit();
+					}
+				}
+			}
+
+			break;
+
+		default:
+			header('Content-Type: video/mp2t');
+
+			if (file_exists($rPlaylist)) {
+				if (file_exists(STREAMS_PATH . $rStreamID . '_.dur')) {
+					$rDuration = intval(file_get_contents(STREAMS_PATH . $rStreamID . '_.dur'));
+
+					if ($rSegmentSettings['seg_time'] < $rDuration) {
+						$rSegmentSettings['seg_time'] = $rDuration;
+					}
+				}
+
+				$rSegments = StreamUtils::getPlaylistSegments($rPlaylist, $rPrebuffer, $rSegmentSettings['seg_time']);
+			} else {
+				$rSegments = null;
+			}
+
+			if (!is_null($rSegments)) {
+				if (is_array($rSegments)) {
+					$rBytes = 0;
+					$rStartTime = time();
+
+					foreach ($rSegments as $rSegment) {
+						if (file_exists(STREAMS_PATH . $rSegment)) {
+							$rBytes += readfile(STREAMS_PATH . $rSegment);
+						} else {
+							// Prebuffer segment already rotated out (hls_delete_threshold) → skip instead of
+							// exit(), otherwise the loopback connection drops and restarts in a loop.
+							continue;
+						}
+					}
+					preg_match('/_(.*)\\./', array_pop($rSegments), $rCurrentSegment);
+					$rCurrent = $rCurrentSegment[1];
+				} else {
+					$rCurrent = $rSegments;
+				}
+			} else {
+				if (!file_exists($rPlaylist)) {
+					$rCurrent = -1;
+				} else {
+					exit();
+				}
+			}
+
+			$rFails = 0;
+			$rTotalFails = StreamUtils::segmentRetryBudget($rSegmentSettings['seg_time'], intval(SettingsManager::get('segment_wait_time')));
+
+			while (true) {
+				$rSegmentFile = sprintf('%d_%d.ts', $rStreamID, $rCurrent + 1);
+				$rNextSegment = sprintf('%d_%d.ts', $rStreamID, $rCurrent + 2);
+				$rChecks = 0;
+
+				while (!file_exists(STREAMS_PATH . $rSegmentFile) && $rChecks <= $rTotalFails * 10) {
+					usleep(100000);
+					$rChecks++;
+				}
+
+				if (!file_exists(STREAMS_PATH . $rSegmentFile)) {
+					exit();
+				}
+
+				if ((empty($rChannelInfo['pid']) && file_exists(STREAMS_PATH . $rStreamID . '_.pid'))) {
+					$rChannelInfo['pid'] = intval(file_get_contents(STREAMS_PATH . $rStreamID . '_.pid'));
+				}
+
+				$rFP = fopen(STREAMS_PATH . $rSegmentFile, 'r');
+				if (!is_resource($rFP)) {
+					exit();
+				}
+				$rFails = 0;
+
+				// Stream the ENTIRE segment (following it as it grows), then advance $rCurrent.
+				// The original always reopened $rCurrent+1 from offset 0 and had $rCurrent++ outside
+				// while(true) (unreachable), so it re-served the same ~6s segment in a loop → PCR frozen on the consumer.
+				while (true) {
+					$rData = stream_get_line($rFP, SettingsManager::get('read_buffer_size'));
+
+					if ($rData !== '' && $rData !== false) {
+						echo $rData;
+						$rData = '';
+						$rFails = 0;
+
+						continue;
+					}
+
+					// no new data at this moment
+					if (file_exists(STREAMS_PATH . $rNextSegment)) {
+						// next segment already exists → current one is complete; drain the remainder and advance
+						clearstatcache(true, STREAMS_PATH . $rSegmentFile);
+						$rRestSize = (($rSegSize = @filesize(STREAMS_PATH . $rSegmentFile)) !== false ? $rSegSize - ftell($rFP) : 0);
+
+						if (0 < $rRestSize) {
+							echo stream_get_line($rFP, $rRestSize);
+						}
+
+						break;
+					}
+
+					if (!ProcessManager::isStreamRunning($rChannelInfo['pid'], $rStreamID)) {
+						fclose($rFP);
+
+						exit();
+					}
+
+					usleep(100000);
+					$rFails++;
+
+					// Allow enough time (>= segment duration). With a 0.1s usleep the limit must be
+					// $rTotalFails*10 (~20s), not $rTotalFails (~2s), otherwise we give up before the next
+					// segment (hls_time=6s) appears → loopback connection drops and restarts every ~5s.
+					if ($rTotalFails * 10 < $rFails) {
+						fclose($rFP);
+
+						exit();
+					}
+				}
+
+				fclose($rFP);
+				$rFails = 0;
+				$rCurrent++;
+			}
+	}
+} else {
+	generate404();
+}
+
+function shutdown() {
+	global $db;
+	global $rChannelInfo;
+	global $rPID;
+	global $rStreamID;
+
+	if (is_object($db)) {
+		$db->close_mysql();
+	}
+
+	if ((SettingsManager::get('on_demand_instant_off') && $rChannelInfo['on_demand'] == 1)) {
+		ConnectionTracker::removeFromQueue($rStreamID, $rPID);
+	}
+}
