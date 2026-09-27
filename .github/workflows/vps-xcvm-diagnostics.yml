@@ -1,0 +1,60 @@
+name: VPS XC_VM diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xcvm-test-vps
+  cancel-in-progress: false
+
+jobs:
+  diagnostics:
+    name: Validate XC_VM test server
+    runs-on: [self-hosted]
+    timeout-minutes: 10
+    steps:
+      - name: Check runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          hostname
+          id
+          printf 'Workspace: %s\n' "$GITHUB_WORKSPACE"
+
+      - name: Check XC_VM installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d /home/xc_vm
+          test -x /home/xc_vm/bin/php/bin/php
+          /home/xc_vm/bin/php/bin/php -v | head -n 4
+          find /home/xc_vm/Modules -maxdepth 2 -name module.json -print | sort
+
+      - name: Validate Flussonic module syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            /home/xc_vm/bin/php/bin/php -d opcache.enable_cli=0 -l "$file"
+          done < <(find "$GITHUB_WORKSPACE/src/Modules/flussonic_1f4a9" -type f -name '*.php' -print0)
+
+      - name: Compare deployed module
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /home/xc_vm/Modules/flussonic_1f4a9 ]; then
+            diff -ru "$GITHUB_WORKSPACE/src/Modules/flussonic_1f4a9" /home/xc_vm/Modules/flussonic_1f4a9 || {
+              echo '::warning::The deployed Flussonic module differs from this commit.'
+            }
+          else
+            echo '::notice::The Flussonic module is not deployed yet.'
+          fi
+
+      - name: Check XC_VM service
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n systemctl status xc_vm --no-pager -l | sed -n '1,30p'
