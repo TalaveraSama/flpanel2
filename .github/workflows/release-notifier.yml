@@ -1,0 +1,79 @@
+name: Release Notifier
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+      release_name:
+        required: true
+        type: string
+      is_prerelease:
+        required: true
+        type: boolean
+    secrets:
+      TELEGRAM_BOT_TOKEN:
+        required: true
+      TELEGRAM_CHAT_ID:
+        required: true
+      TELEGRAM_TOPIC_ID:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v1.2.3)'
+        required: true
+        type: string
+      release_name:
+        description: 'Release name shown in the message'
+        required: true
+        type: string
+      is_prerelease:
+        description: 'Mark as prerelease (BETA badge)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  notify-telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Release Notification to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TOPIC_ID: ${{ secrets.TELEGRAM_TOPIC_ID }}
+        run: |
+          if [ "${{ inputs.is_prerelease }}" == "true" ]; then
+            RELEASE_TYPE="Prerelease"
+            RELEASE_EMOJI="🧪"
+            RELEASE_BADGE="BETA"
+          else
+            RELEASE_TYPE="Release"
+            RELEASE_EMOJI="🚀"
+            RELEASE_BADGE="STABLE"
+          fi
+
+          RELEASE_TAG="${{ inputs.tag_name }}"
+          RELEASE_NAME="${{ inputs.release_name }}"
+
+          MESSAGE=$(cat <<EOF
+          ${RELEASE_EMOJI} *${RELEASE_TYPE} Published* ${RELEASE_EMOJI}
+          📍 *Status:* \`${RELEASE_BADGE}\`
+
+          🔗 *Release:* [${RELEASE_NAME}](https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG})
+          📦 *Repository:* [${{ github.repository }}](https://github.com/${{ github.repository }})
+          🏷 *Version:* \`${RELEASE_TAG}\`
+          EOF
+          )
+
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"$CHAT_ID\",
+              \"message_thread_id\": \"$TOPIC_ID\",
+              \"text\": \"$MESSAGE\",
+              \"parse_mode\": \"Markdown\"
+            }" \
+            "https://api.telegram.org/bot$BOT_TOKEN/sendMessage"

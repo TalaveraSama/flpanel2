@@ -1,0 +1,210 @@
+site_name: XC_VM
+site_description: XC_VM IPTV panel — user and developer documentation
+site_url: https://vateron-media.github.io/XC_VM/
+repo_url: https://github.com/Vateron-Media/XC_VM
+repo_name: Vateron-Media/XC_VM
+docs_dir: docs
+site_dir: build/site
+edit_uri: edit/main/docs/
+
+# ru/ is a committed generated tree (translated from en/ locally before release)
+# consumed by the i18n plugin. adr/agents/xc_fanout.md are repo-internal English
+# notes, not part of the published site; requirements.txt is toolchain.
+exclude_docs: |
+  adr/
+  agents/
+  xc_fanout.md
+  requirements.txt
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+    - content.tabs.link
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+# Version selector in the header. `mike` publishes one snapshot per release tag
+# to gh-pages (see .github/workflows/pages.yml); `alias: true` surfaces the
+# `latest` alias in the dropdown. Docs are unversioned during local development
+# (`make docs-serve`/`docs-build`); versions exist only on the deployed site.
+extra:
+  version:
+    provider: mike
+    alias: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+  # English is the canonical source (docs/en). Russian (docs/ru) is generated at
+  # build time by tools/i18n/translate.py and consumed here in folder structure.
+  - i18n:
+      docs_structure: folder
+      fallback_to_default: true
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+        - locale: ru
+          name: Русский
+          build: true
+          # Sidebar/tab labels are not part of the translated Markdown, so the
+          # i18n plugin maps each English nav title to its Russian label here.
+          nav_translations:
+            Home: Главная
+            User Guide: Руководство пользователя
+            Administration: Администрирование
+            SSL Certificate Generation: Генерация SSL-сертификата
+            Updating a Server: Обновление сервера
+            Server Diagnostics: Диагностика сервера
+            Update Mechanism: Механизм обновлений
+            Reseller System: Система реселлеров
+            Backup Strategy: Стратегия резервного копирования
+            API Reference: Справочник API
+            Interactive API (Swagger): Интерактивный API (Swagger)
+            Customization: Кастомизация
+            UI Translations: Переводы интерфейса
+            Diagnostics: Диагностика
+            Diagnostics Service: Сервис диагностики
+            Info & FAQ: Информация и FAQ
+            Licensing & Activation: Лицензирование и активация
+            Migration Guide: Руководство по миграции
+            Watch Folder: Отслеживаемая папка
+            Developer Guide: Руководство разработчика
+            Architecture: Архитектура
+            Architecture Overview: Обзор архитектуры
+            Autoloading (PSR-4): Автозагрузка (PSR-4)
+            Bootstrap Contexts: Контексты бутстрапа
+            Core Wiring & Registration: Сборка и регистрация ядра
+            Module Authoring: Создание модулей
+            Module Lifecycle: Жизненный цикл модулей
+            Module Extension Points: Точки расширения модулей
+            HTTP Request Handling: Обработка HTTP-запросов
+            Admin AJAX API: AJAX-API админки
+            Streaming Subsystem: Подсистема стриминга
+            Streaming Diagnostics: Диагностика стриминга
+            Cluster Seams: Швы кластера
+            Event System: Система событий
+            Exception Hierarchy: Иерархия исключений
+            Caching and Redis: Кэширование и Redis
+            Navbar Rendering: Рендеринг навбара
+            Developer Workflow: Рабочий процесс разработчика
+            Development Workflow: Процесс разработки
+            CLI Tools & Console Reference: CLI-инструменты и консоль
+            Database Migrations: Миграции базы данных
+            PHPUnit Setup: Настройка PHPUnit
+            Automated Refactoring (Rector): Автоматический рефакторинг (Rector)
+            Feature Flags: Флаги функций
+            Process Management: Управление процессами
+            Security & Access: Безопасность и доступ
+            Authentication and Sessions: Аутентификация и сессии
+            Permissions and RBAC: Права и RBAC
+            Input Validation: Валидация ввода
+            Error Handling: Обработка ошибок
+            Integrations: Интеграции
+            GeoIP, ISP Detection & Geo Routing: GeoIP, ISP и гео-маршрутизация
+            Device Detection & STB Locking: Определение устройств и STB-блокировки
+            Ministra STB Emulation: Эмуляция Ministra STB
+            UCS Integration: Интеграция UCS
+            Build & Release: Сборка и релиз
+            Build System (MAIN vs LB): Система сборки (MAIN и LB)
+            Pre-release Checklist: Чеклист перед релизом
+
+nav:
+  - Home: en/README.md
+  - User Guide:
+      - Administration:
+          - SSL Certificate Generation: en/administration/ssl-generation.md
+          - Updating a Server: en/administration/server-update.md
+          - Server Diagnostics: en/administration/server-diagnostics.md
+          - Update Mechanism: en/administration/update-system.md
+          - Reseller System: en/administration/reseller-system.md
+          - Backup Strategy: en/administration/backup-strategy.md
+      - API Reference:
+          - Interactive API (Swagger): en/api/swagger.md
+      - Customization:
+          - UI Translations: en/guides/translations.md
+      - Diagnostics:
+          - Diagnostics Service: en/guides/diagnostics-api.md
+      - Info & FAQ:
+          - FAQ: en/info/faq.md
+          - Licensing & Activation: en/info/licensing-and-activation.md
+          - Migration Guide: en/info/migration_guide.md
+          - Watch Folder: en/info/watch_folder.md
+  - Developer Guide:
+      - Architecture:
+          - Architecture Overview: en/development/architecture.md
+          - Autoloading (PSR-4): en/development/autoloader.md
+          - Bootstrap Contexts: en/development/bootstrap-contexts.md
+          - Core Wiring & Registration: en/development/core-wiring.md
+          - Module Authoring: en/development/module-authoring.md
+          - Module Lifecycle: en/development/module-lifecycle.md
+          - Module Extension Points: en/development/module-extension-points.md
+          - HTTP Request Handling: en/development/http-request-handling.md
+          - Admin AJAX API: en/development/admin-ajax-api.md
+          - Streaming Subsystem: en/development/streaming-subsystem.md
+          - Streaming Diagnostics: en/development/streaming-diagnostics.md
+          - Cluster Seams: en/development/cluster-seams.md
+          - Event System: en/development/event-system.md
+          - Exception Hierarchy: en/development/exception-hierarchy.md
+          - Caching and Redis: en/development/caching-and-redis.md
+          - Navbar Rendering: en/development/navbar-rendering.md
+      - Developer Workflow:
+          - Development Workflow: en/guides/dev-workflow.md
+          - CLI Tools & Console Reference: en/guides/cli-tools.md
+          - Database Migrations: en/guides/database-migrations.md
+          - PHPUnit Setup: en/guides/phpunit-phar.md
+          - Automated Refactoring (Rector): en/guides/refactoring.md
+          - Feature Flags: en/guides/feature-flags.md
+          - Process Management: en/guides/process-management.md
+      - Security & Access:
+          - Authentication and Sessions: en/guides/authentication-and-sessions.md
+          - Permissions and RBAC: en/guides/permissions-and-rbac.md
+          - Input Validation: en/guides/input-validation.md
+          - Error Handling: en/guides/error-handling.md
+      - Integrations:
+          - GeoIP, ISP Detection & Geo Routing: en/guides/geoip-isp-and-geo-routing.md
+          - Device Detection & STB Locking: en/guides/device-detection-and-stb-locking.md
+          - Ministra STB Emulation: en/guides/ministra-browser-emulation.md
+          - UCS Integration: en/guides/ucs-integration.md
+      - Build & Release:
+          - Build System (MAIN vs LB): en/builds/build_system.md
+          - Pre-release Checklist: en/builds/updates_checklist.md

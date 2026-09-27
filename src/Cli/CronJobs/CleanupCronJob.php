@@ -1,0 +1,233 @@
+<?php
+
+namespace XcVm\Cli\CronJobs;
+
+use XcVm\Cli\CommandInterface;
+use XcVm\Cli\CronTrait;
+use XcVm\Core\Cluster\ConnectAudit;
+use XcVm\Core\Cluster\NodeRole;
+use XcVm\Core\Config\SettingsManager;
+use XcVm\Core\Diagnostics\DiagnosticsService;
+use XcVm\Domain\Server\InstallCredentials;
+use XcVm\Domain\Stream\ContentSink;
+use XcVm\Domain\Stream\StreamProcess;
+use XcVm\Domain\Stream\StreamSorter;
+use XcVm\Domain\Stream\StreamStateWriter;
+use XcVm\Streaming\Codec\FFmpegCommand;
+use XcVm\Streaming\Codec\FFprobeRunner;
+
+/**
+ * CleanupCronJob — cleanup cron job
+ *
+ * @package XC_VM_CLI_CronJobs
+ * @author  Divarion_D <https://github.com/Divarion-D>
+ * @copyright 2025-2026 Vateron Media
+ * @link    https://github.com/Vateron-Media/XC_VM
+ * @license AGPL-3.0 https://www.gnu.org/licenses/agpl-3.0.html
+ */
+
+class CleanupCronJob implements CommandInterface {
+	use CronTrait;
+
+	public function getName(): string {
+		return 'cron:cleanup';
+	}
+
+	public function getDescription(): string {
+		return 'Cron: cleanup streams, archives, VOD, rotate tables';
+	}
+
+	public function execute(array $rArgs): int {
+		if (!$this->assertRunAsXcVm()) {
+			return 1;
+		}
+
+		$this->initCron('XC_VM[Cleanup]');
+
+		$rTimeout = 3600;
+		set_time_limit($rTimeout);
+		ini_set('max_execution_time', $rTimeout);
+
+		$this->loadCron();
+
+		return 0;
+	}
+
+	private function loadCron(): void {
+		global $db;
+
+		if (intval(SettingsManager::get('cleanup')) == 1) {
+			$rStreams = [];
+			$db->query('SELECT `id` FROM `streams` LEFT JOIN `streams_servers` ON `streams_servers`.`stream_id` = `streams`.`id` WHERE `streams`.`type` IN (1,3,4) AND `streams_servers`.`server_id` = ?;', SERVER_ID);
+			foreach ($db->get_rows() as $rRow) {
+				$rStreams[] = intval($rRow['id']);
+			}
+			foreach (glob(STREAMS_PATH . '*') as $rFilename) {
+				$rID = intval(rtrim(explode('.', basename($rFilename))[0], '_')) . "\n";
+				if (0 < $rID && !in_array($rID, $rStreams)) {
+					echo 'Deleting: ' . $rFilename . "\n";
+					unlink($rFilename);
+				}
+			}
+			$rArchive = [];
+			$db->query('SELECT `id`, `tv_archive_duration` FROM `streams` WHERE `type` = 1 AND `tv_archive_server_id` = ? AND `tv_archive_duration` > 0;', SERVER_ID);
+			foreach ($db->get_rows() as $rRow) {
+				$rArchive[intval($rRow['id'])] = $rRow['tv_archive_duration'];
+			}
+			date_default_timezone_set('UTC');
+			foreach (glob(ARCHIVE_PATH . '*') as $rStreamID) {
+				$rID = intval(basename($rStreamID));
+				if (0 < $rID && is_dir(ARCHIVE_PATH . $rID)) {
+					if (!isset($rArchive[$rID])) {
+						echo 'Deleting: ' . $rStreamID . "\n";
+						exec('rm -rf ' . $rStreamID);
+					} else {
+						$rDuration = $rArchive[$rID];
+						$rDeleteBefore = time() - $rDuration * 86400 + 3600;
+						foreach (glob(ARCHIVE_PATH . $rID . '/*') as $rArchiveFile) {
+							list($rDate, $rTime) = explode(':', explode('.', basename($rArchiveFile))[0]);
+							list($rHour, $rMinute) = explode('-', $rTime);
+							$rFileTime = strtotime($rDate . ' ' . $rHour . ':' . $rMinute . ':00');
+							if ($rFileTime < $rDeleteBefore) {
+								echo 'Deleting: ' . $rArchiveFile . "\n";
+								unlink($rArchiveFile);
+							}
+						}
+					}
+				}
+			}
+			$rCreated = [];
+			$db->query('SELECT `id` FROM `streams` LEFT JOIN `streams_servers` ON `streams_servers`.`stream_id` = `streams`.`id` WHERE `streams`.`type` = 3 AND `streams_servers`.`server_id` = ?;', SERVER_ID);
+			foreach ($db->get_rows() as $rRow) {
+				$rCreated[] = intval($rRow['id']);
+			}
+			foreach (glob(CREATED_PATH . '*') as $rFilename) {
+				$rID = intval(rtrim(explode('.', basename($rFilename))[0], '_')) . "\n";
+				if (0 < $rID && !in_array($rID, $rCreated)) {
+					echo 'Deleting: ' . $rFilename . "\n";
+					unlink($rFilename);
+				}
+			}
+		}
+
+		if (intval(SettingsManager::get('check_vod')) == 1) {
+			$db->query('SELECT `server_stream_id`, `id`, `target_container`, `movie_properties`, `stream_status` FROM `streams` LEFT JOIN `streams_servers` ON `streams_servers`.`stream_id` = `streams`.`id` WHERE `server_id` = ? AND `type` IN (2,5) AND `streams`.`direct_source` = 0 AND `streams_servers`.`pid` > 0;', SERVER_ID);
+			if ($db->num_rows() > 0) {
+				$rRows = $db->get_rows();
+				foreach ($rRows as $rRow) {
+					$rMoviePath = VOD_PATH . $rRow['id'] . '.' . $rRow['target_container'];
+					if ($rRow['stream_status'] == 0) {
+						if (!file_exists($rMoviePath)) {
+							echo 'BAD MOVIE' . "\n";
+							StreamStateWriter::updateRow(intval($rRow['server_stream_id']), ['stream_status' => 1], $db);
+							StreamProcess::updateStream($rRow['id']);
+						}
+					} elseif ($rRow['stream_status'] == 1) {
+						if (file_exists($rMoviePath) && ($rFFProbee = FFprobeRunner::probeStream($rMoviePath))) {
+							$rDuration = (isset($rFFProbee['duration']) ? $rFFProbee['duration'] : 0);
+							sscanf($rDuration, '%d:%d:%d', $rHours, $rMinutes, $rSeconds);
+							$rSeconds = (isset($rSeconds) ? $rHours * 3600 + $rMinutes * 60 + $rSeconds : $rHours * 60 + $rMinutes);
+							$rSize = filesize($rMoviePath);
+							$rBitrate = round(($rSize * 0.008) / $rSeconds);
+							$rMovieProperties = json_decode($rRow['movie_properties'], true);
+							if (!is_array($rMovieProperties)) {
+								$rMovieProperties = [];
+							}
+							if (!isset($rMovieProperties['duration_secs']) || $rSeconds != $rMovieProperties['duration_secs']) {
+								$rMovieProperties['duration_secs'] = $rSeconds;
+								$rMovieProperties['duration'] = $rDuration;
+							}
+							if (!isset($rMovieProperties['video']) || $rFFProbee['codecs']['video']['codec_name'] != $rMovieProperties['video']) {
+								$rMovieProperties['video'] = $rFFProbee['codecs']['video'];
+							}
+							if (!isset($rMovieProperties['audio']) || $rFFProbee['codecs']['audio']['codec_name'] != $rMovieProperties['audio']) {
+								$rMovieProperties['audio'] = $rFFProbee['codecs']['audio'];
+							}
+							if (SettingsManager::get('extract_subtitles')) {
+								if (!isset($rMovieProperties['subtitle']) || $rFFProbee['codecs']['subtitle']['codec_name'] != $rMovieProperties['subtitle']) {
+									$rMovieProperties['subtitle'] = $rFFProbee['codecs']['subtitle'];
+								}
+							}
+							if (!isset($rMovieProperties['bitrate']) || $rBitrate != $rMovieProperties['bitrate']) {
+								if (0 < $rBitrate) {
+									$rMovieProperties['bitrate'] = $rBitrate;
+								} else {
+									$rBitrate = $rMovieProperties['bitrate'];
+								}
+							}
+							if (isset($rFFProbee['codecs']['subtitle']) && SettingsManager::get('extract_subtitles')) {
+								$i = 0;
+								foreach ($rFFProbee['codecs']['subtitle'] as $rSubtitle) {
+									FFmpegCommand::extractSubtitle($rRow['stream_id'], $rMoviePath, $i);
+									$i++;
+								}
+							}
+							$rCompatible = intval(DiagnosticsService::checkCompatibility($rFFProbee, SettingsManager::get('player_allow_hevc')));
+							$rAudioCodec = ($rFFProbee['codecs']['audio']['codec_name'] ?: null);
+							$rVideoCodec = ($rFFProbee['codecs']['video']['codec_name'] ?: null);
+							$rResolution = ($rFFProbee['codecs']['video']['height'] ?: null);
+							if ($rResolution) {
+								$rResolution = StreamSorter::getNearest([240, 360, 480, 576, 720, 1080, 1440, 2160], $rResolution);
+							}
+							ContentSink::movieProperties((int) $rRow['id'], $rMovieProperties, $db);
+							StreamStateWriter::updateRow(intval($rRow['server_stream_id']), ['bitrate' => $rBitrate, 'to_analyze' => 0, 'stream_status' => 0, 'stream_info' => json_encode($rFFProbee, JSON_UNESCAPED_UNICODE), 'audio_codec' => $rAudioCodec, 'video_codec' => $rVideoCodec, 'resolution' => $rResolution, 'compatible' => $rCompatible], $db);
+							StreamProcess::updateStream($rRow['id']);
+							echo 'VALID MOVIE' . "\n";
+						}
+					}
+				}
+			}
+			$db->query("SELECT `id`, `stream_display_name`, `server_stream_id` FROM `streams` t1 INNER JOIN `streams_servers` t3 ON t3.stream_id = t1.id LEFT JOIN `profiles` t2 ON t2.profile_id = t1.transcode_profile_id WHERE t1.type = 3 AND t3.server_id = ? AND JSON_CONTAINS(t3.cchannel_rsources, t1.stream_source) AND JSON_CONTAINS(t1.stream_source, t3.cchannel_rsources) AND t3.pids_create_channel = '[]';", SERVER_ID);
+			if ($db->num_rows() > 0) {
+				$rStreams = $db->get_rows();
+				foreach ($rStreams as $rStream) {
+					echo "\n\n" . '[*] Checking Channel ' . $rStream['stream_display_name'] . "\n";
+					if (file_exists(CREATED_PATH . $rStream['id'] . '_.list')) {
+						$rList = explode("\n", file_get_contents(CREATED_PATH . $rStream['id'] . '_.list'));
+						$rExisting = glob(CREATED_PATH . $rStream['id'] . '*.*');
+						$rFailure = false;
+						$rActualFiles = [];
+						foreach ($rList as $rItem) {
+							$rFilename = trim(explode("'", explode("'", $rItem)[1])[0]);
+							if ($rFilename !== '') {
+								if (in_array($rFilename, $rExisting)) {
+									$rActualFiles[] = $rFilename;
+								} else {
+									$rFailure = true;
+								}
+							}
+						}
+						if ($rFailure) {
+							echo 'BAD CHANNEL' . "\n";
+							StreamStateWriter::updateRow(intval($rStream['server_stream_id']), ['cchannel_rsources' => json_encode($rActualFiles, JSON_UNESCAPED_UNICODE)], $db);
+							StreamProcess::updateStream($rStream['id']);
+						}
+					} else {
+						echo 'BAD CHANNEL' . "\n";
+						StreamStateWriter::updateRow(intval($rStream['server_stream_id']), ['cchannel_rsources' => '[]'], $db);
+						StreamProcess::updateStream($rStream['id']);
+					}
+				}
+			}
+		}
+
+		// This node's connect audit: the cutover gate reads seven days of it.
+		ConnectAudit::prune(8);
+
+		// Retention of cluster-wide log tables: MAIN's job. Every LB used to
+		// run the same DELETEs against MAIN's database each minute.
+		if (!NodeRole::isMain()) {
+			return;
+		}
+		// SSH passwords saved by installs before they moved to one-shot cred files.
+		InstallCredentials::scrubLegacyMetadata();
+		$rTables = ['lines_activity' => ['keep_activity', 'date_end'], 'lines_logs' => ['keep_client', 'date'], 'login_logs' => ['keep_login', 'date'], 'streams_errors' => ['keep_errors', 'date'], 'streams_logs' => ['keep_restarts', 'date'], 'ondemand_check' => ['on_demand_scan_keep', 'date']];
+		foreach ($rTables as $rTable => $rArray) {
+			// lb-settings: keep_activity, keep_client, keep_login, keep_errors, keep_restarts, on_demand_scan_keep
+			if (SettingsManager::getAll()[$rArray[0]] && 0 < SettingsManager::getAll()[$rArray[0]]) {
+				$rDeleteBefore = time() - intval(SettingsManager::getAll()[$rArray[0]]); // lb-settings: keep_activity, keep_client, keep_login, keep_errors, keep_restarts, on_demand_scan_keep
+				$db->query('DELETE FROM `' . $rTable . '` WHERE `' . $rArray[1] . '` < ?;', $rDeleteBefore);
+			}
+		}
+	}
+}
