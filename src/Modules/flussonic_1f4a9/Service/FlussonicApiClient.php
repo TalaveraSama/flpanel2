@@ -42,20 +42,63 @@ final class FlussonicApiClient {
 		if ($streamName === '') {
 			throw new FlussonicApiException('Stream name must not be empty.');
 		}
-		return $this->request('GET', '/streamer/api/v3/streams/' . rawurlencode($streamName));
+		return $this->request('GET', $this->streamPath($streamName));
 	}
 
 	/** @return array<string,mixed> */
-	private function request(string $method, string $path, array $query = []): array {
+	public function createStream(string $streamName, array $configuration): array {
+		return $this->request('PUT', $this->streamPath($streamName), [], $configuration);
+	}
+
+	/** @return array<string,mixed> */
+	public function updateStream(string $streamName, array $configuration): array {
+		return $this->request('PATCH', $this->streamPath($streamName), [], $configuration);
+	}
+
+	/** @return array<string,mixed> */
+	public function deleteStream(string $streamName): array {
+		return $this->request('DELETE', $this->streamPath($streamName));
+	}
+
+	/** @return array<string,mixed> */
+	public function startStream(string $streamName): array {
+		return $this->request('POST', $this->streamPath($streamName) . '/start');
+	}
+
+	/** @return array<string,mixed> */
+	public function stopStream(string $streamName): array {
+		return $this->request('POST', $this->streamPath($streamName) . '/stop');
+	}
+
+	/** @return array<string,mixed> */
+	public function restartStream(string $streamName): array {
+		return $this->request('POST', $this->streamPath($streamName) . '/restart');
+	}
+
+	private function streamPath(string $streamName): string {
+		$streamName = trim($streamName);
+		if ($streamName === '') {
+			throw new FlussonicApiException('Stream name must not be empty.');
+		}
+		return '/streamer/api/v3/streams/' . rawurlencode($streamName);
+	}
+
+	/** @return array<string,mixed> */
+	private function request(string $method, string $path, array $query = [], ?array $payload = null): array {
 		$url = $this->baseUrl . $path;
 		if ($query !== []) {
 			$url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
 		}
 		$headers = ['Accept: application/json'];
+		$body = null;
+		if ($payload !== null) {
+			$body = json_encode($payload, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+			$headers[] = 'Content-Type: application/json';
+		}
 		if ($this->username !== '' || $this->password !== '') {
 			$headers[] = 'Authorization: Basic ' . base64_encode($this->username . ':' . $this->password);
 		}
-		$response = $this->transport->request($method, $url, $headers, null, [
+		$response = $this->transport->request($method, $url, $headers, $body, [
 			'verify_tls' => $this->verifyTls,
 			'connect_timeout' => $this->connectTimeout,
 			'timeout' => $this->requestTimeout,
