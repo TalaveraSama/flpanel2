@@ -1,0 +1,75 @@
+name: VPS XC_VM source audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xcvm-source-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate connection secrets
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          for name in VPS_HOST VPS_USER VPS_PORT VPS_SSH_KEY; do
+            [ -n "${!name:-}" ] || { echo "::error::Missing GitHub secret: $name"; exit 1; }
+          done
+
+      - name: Configure temporary SSH identity
+        shell: bash
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/xcvm_audit
+          ssh-keygen -y -f ~/.ssh/xcvm_audit >/dev/null
+
+      - name: Run read-only audit
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          SSH=(ssh -i ~/.ssh/xcvm_audit -p "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+          SCP=(scp -i ~/.ssh/xcvm_audit -P "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+          "${SSH[@]}" "$VPS_USER@$VPS_HOST" 'echo SSH_OK; id; hostname'
+          "${SCP[@]}" ops/audit-xcvm.sh "$VPS_USER@$VPS_HOST:/home/xcvm_audit/work/audit-xcvm.sh"
+          "${SSH[@]}" "$VPS_USER@$VPS_HOST" 'chmod 700 /home/xcvm_audit/work/audit-xcvm.sh && rm -rf /home/xcvm_audit/work/xcvm-audit && /home/xcvm_audit/work/audit-xcvm.sh'
+          mkdir -p audit-result
+          "${SCP[@]}" -r "$VPS_USER@$VPS_HOST:/home/xcvm_audit/work/xcvm-audit/." audit-result/
+
+      - name: Scan report for accidental secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RniE '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|password[[:space:]]*=|api[_-]?key[[:space:]]*=|token[[:space:]]*=)' audit-result; then
+            echo '::error::Potential secret found; refusing artifact upload.'
+            exit 1
+          fi
+
+      - name: Upload sanitized audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcvm-source-audit
+          path: audit-result
+          retention-days: 3
+          if-no-files-found: error
